@@ -50,6 +50,7 @@ nav = [
       {"COCO Utils" = "utils/coco.md"},
       {"Computer Vision Utils" = "utils/cv.md"},
       {"File Utils" = "utils/file.md"},
+      {"Lazy Image Utils" = "utils/lazy_image.md"},
     ]},
   ]},
   {"API Reference Index" = "api.md"},

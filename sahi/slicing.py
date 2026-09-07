@@ -18,6 +18,7 @@ from sahi.logger import logger
 from sahi.utils.coco import Coco, CocoAnnotation, CocoImage, create_coco_dict
 from sahi.utils.cv import IMAGE_EXTENSIONS_LOSSY, read_image_as_pil
 from sahi.utils.file import load_json, save_json
+from sahi.utils.lazy_image import LazyImageSource, is_lazy_image_source, open_large_image_source
 
 _CPU_COUNT = os.cpu_count() or 4
 MAX_WORKERS = max(1, min(32, _CPU_COUNT * 2))
@@ -151,20 +152,55 @@ def process_coco_annotations(
 class SlicedImage:
     """Container for a sliced image and its metadata."""
 
-    def __init__(self, image: np.ndarray, coco_image: CocoImage, starting_pixel: list[int]) -> None:
+    def __init__(
+        self,
+        image: np.ndarray | None,
+        coco_image: CocoImage,
+        starting_pixel: list[int],
+        source: Any | None = None,
+        slice_bbox: list[int] | None = None,
+    ) -> None:
         """Initialize SlicedImage.
 
         Args:
             image: np.array
-                Sliced image.
+                Sliced image. May be None when `source` and `slice_bbox` are given, in
+                which case the pixels are read from the source on each access instead.
             coco_image: CocoImage
                 Coco styled image object that belong to sliced image.
             starting_pixel: list of list of int
                 Starting pixel coordinates of the sliced image.
+            source: optional
+                What to read the pixels from when `image` is None. Anything indexable as
+                `source[top:bottom, left:right]`, such as a LazyImageSource.
+            slice_bbox: list of int, optional
+                This slice's [left, top, right, bottom] region within `source`.
         """
-        self.image = image
+        self._image = image
         self.coco_image = coco_image
         self.starting_pixel = starting_pixel
+        self._source = source
+        self._slice_bbox = slice_bbox
+
+    @property
+    def image(self) -> np.ndarray:
+        """The slice pixels.
+
+        Read from the source on every access when the slice was created without them.
+        The read is deliberately not cached: holding every slice read so far is the
+        memory cost a lazy source exists to avoid.
+        """
+        if self._image is not None:
+            return self._image
+        if self._source is None or self._slice_bbox is None:
+            raise ValueError("SlicedImage was given neither pixels nor a source to read them from.")
+        left, top, right, bottom = self._slice_bbox
+        return self._source[top:bottom, left:right]
+
+    @image.setter
+    def image(self, value: np.ndarray) -> None:
+        """Set the slice pixels, replacing any deferred read."""
+        self._image = value
 
 
 class SliceImageResult:
@@ -175,6 +211,7 @@ class SliceImageResult:
         original_image_size: list[int],
         image_dir: str | None = None,
         original_image: np.ndarray | None = None,
+        owned_source: LazyImageSource | None = None,
     ) -> None:
         """Initialize SliceImageResult.
 
@@ -192,8 +229,33 @@ class SliceImageResult:
         self.original_image_width = original_image_size[1]
         self.image_dir = image_dir
         self.original_image = original_image
+        # a source opened on the caller's behalf is this result's to close. One the caller
+        # opened is not, so it is never stored here.
+        self._owned_source = owned_source
 
         self._sliced_image_list: list[SlicedImage] = []
+
+    @property
+    def is_lazy(self) -> bool:
+        """Whether slices are read from a source on access rather than held in memory."""
+        return bool(self._sliced_image_list) and self._sliced_image_list[0]._image is None
+
+    def close(self) -> None:
+        """Close the source this result opened, if it opened one.
+
+        A source the caller passed in stays open: closing it is the caller's to do.
+        """
+        if self._owned_source is not None:
+            self._owned_source.close()
+            self._owned_source = None
+
+    def __enter__(self) -> SliceImageResult:
+        """Enter a context that closes any source this result opened."""
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        """Close any source this result opened."""
+        self.close()
 
     def add_sliced_image(self, sliced_image: SlicedImage) -> None:
         """Add a sliced image to the result."""
@@ -255,6 +317,31 @@ class SliceImageResult:
             filenames.append(sliced_image.coco_image.file_name)
         return filenames
 
+    def slice_at(self, i: int) -> np.ndarray:
+        """Return the pixels of slice `i`.
+
+        Prefer this to `images[i]`. `images` rebuilds the list of every slice on each
+        call, which is O(n) per access and, on a lazy source, reads the whole image.
+
+        Args:
+            i: Index of the slice.
+
+        Returns:
+            numpy.ndarray: The slice, as an HWC array.
+        """
+        return self._sliced_image_list[i].image
+
+    def starting_pixel_at(self, i: int) -> list[int]:
+        """Return the starting pixel of slice `i` without building the full list.
+
+        Args:
+            i: Index of the slice.
+
+        Returns:
+            list of int: The slice's starting pixel coordinates as [x, y].
+        """
+        return self._sliced_image_list[i].starting_pixel
+
     def __getitem__(self, i: int | slice | list | tuple) -> dict | list:
         """Get sliced image(s) by index or slice."""
 
@@ -303,7 +390,7 @@ def _slice_file_suffix(image: str | Image.Image | np.ndarray, out_ext: str | Non
 
 
 def slice_image(
-    image: str | Image.Image | np.ndarray,
+    image: str | Image.Image | np.ndarray | LazyImageSource,
     coco_annotation_list: list[CocoAnnotation] | None = None,
     output_file_name: str | None = None,
     output_dir: str | None = None,
@@ -316,11 +403,15 @@ def slice_image(
     out_ext: str | None = None,
     verbose: bool | None = False,
     exif_fix: bool = True,
+    auto_lazy: bool = True,
 ) -> SliceImageResult:
     """Slice a large image into smaller windows. If output_file_name and output_dir is given, export sliced images.
 
     Args:
-        image (str or PIL.Image): File path of image or Pillow Image to be sliced.
+        image (str or PIL.Image or np.ndarray or LazyImageSource): File path of image, Pillow Image,
+            numpy array, or a LazyImageSource to be sliced. A LazyImageSource is never decoded
+            whole: each slice is read from it on access, so an image larger than memory can be
+            sliced by holding only the slices in use.
         coco_annotation_list (List[CocoAnnotation], optional): List of CocoAnnotation objects.
         output_file_name (str, optional): Root name of output files (coordinates will
             be appended to this)
@@ -342,6 +433,9 @@ def slice_image(
         verbose (bool, optional): Switch to print relevant values to screen.
             Default 'False'.
         exif_fix (bool): Whether to apply an EXIF fix to the image.
+        auto_lazy (bool): Whether a path to an image too large to decode may be read in
+            regions instead. Only a tiled TIFF over `LARGE_IMAGE_THRESHOLD_BYTES` qualifies,
+            so ordinary images are unaffected. Set False to always decode. Default True.
 
     Returns:
         sliced_image_result: SliceImageResult:
@@ -354,8 +448,10 @@ def slice_image(
     # define verboseprint
     verboselog = logger.info if verbose else lambda *a, **k: None
 
-    def _export_single_slice(image: np.ndarray, output_dir: str, slice_file_name: str) -> None:
-        image_pil = read_image_as_pil(image, exif_fix=exif_fix)
+    def _export_single_slice(slice_index: int, output_dir: str, slice_file_name: str) -> None:
+        # the slice is read inside the worker so a lazy source holds only the slices
+        # being written rather than all of them at once
+        image_pil = read_image_as_pil(sliced_image_result.slice_at(slice_index), exif_fix=exif_fix)
         slice_file_path = str(Path(output_dir) / slice_file_name)
         # export sliced image
         image_pil.save(slice_file_path)
@@ -366,8 +462,21 @@ def slice_image(
     if output_dir is not None:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # read as an array, so no full-size PIL copy is held alongside it
-    image_arr: np.ndarray = read_image_as_pil(image, exif_fix=exif_fix, return_arr=True)  # type: ignore[assignment]
+    # a path to an image too large to decode is read in regions instead, so that callers
+    # can pass one without having to know that is what happened
+    owned_source = open_large_image_source(image) if auto_lazy else None
+    if owned_source is not None:
+        image = owned_source
+
+    # a lazy source is already what slices are read from, so there is nothing to decode
+    # and no full-size array for the result to hold on to
+    slice_source_is_lazy = is_lazy_image_source(image)
+    image_arr: np.ndarray | LazyImageSource
+    if slice_source_is_lazy:
+        image_arr = image  # type: ignore[assignment]
+    else:
+        # read as an array, so no full-size PIL copy is held alongside it
+        image_arr = read_image_as_pil(image, exif_fix=exif_fix, return_arr=True)  # type: ignore[assignment]
     image_height, image_width = image_arr.shape[:2]
     verboselog("image.shape: " + str((image_width, image_height)))
 
@@ -387,7 +496,12 @@ def slice_image(
 
     # init images and annotations lists
     sliced_image_result = SliceImageResult(
-        original_image_size=[image_height, image_width], image_dir=output_dir, original_image=image_arr
+        original_image_size=[image_height, image_width],
+        image_dir=output_dir,
+        # a lazy source has no decoded image to reuse, and materializing one here would
+        # defeat the point of slicing it lazily
+        original_image=None if slice_source_is_lazy else image_arr,  # type: ignore[arg-type]
+        owned_source=owned_source,
     )
 
     suffix = _slice_file_suffix(image, out_ext)
@@ -401,7 +515,9 @@ def slice_image(
         tly = slice_bbox[1]
         brx = slice_bbox[2]
         bry = slice_bbox[3]
-        image_pil_slice = image_arr[tly:bry, tlx:brx]
+        # an in-memory slice is a free view into the decode, so it is taken now as before.
+        # a lazy one is left to be read on access, so slices do not accumulate.
+        image_pil_slice = None if slice_source_is_lazy else image_arr[tly:bry, tlx:brx]
 
         # set image file name and path
         slice_suffixes = "_".join(map(str, slice_bbox))
@@ -422,7 +538,11 @@ def slice_image(
 
         # create sliced image and append to sliced_image_result
         sliced_image = SlicedImage(
-            image=image_pil_slice, coco_image=coco_image, starting_pixel=[slice_bbox[0], slice_bbox[1]]
+            image=image_pil_slice,
+            coco_image=coco_image,
+            starting_pixel=[slice_bbox[0], slice_bbox[1]],
+            source=image_arr,
+            slice_bbox=[tlx, tly, brx, bry],
         )
         sliced_image_result.add_sliced_image(sliced_image)
 
@@ -437,7 +557,7 @@ def slice_image(
             list(
                 executor.map(
                     _export_single_slice,
-                    sliced_image_result.images,
+                    range(len(sliced_image_result)),
                     [output_dir] * len(sliced_image_result),
                     sliced_image_result.filenames,
                 )

@@ -37,6 +37,7 @@ from sahi.utils.cv import (
 )
 from sahi.utils.file import Path, increment_path, list_files, save_json, save_pickle
 from sahi.utils.import_utils import check_requirements
+from sahi.utils.lazy_image import LazyImageSource, is_lazy_image_source
 
 POSTPROCESS_NAME_TO_CLASS: dict[str, Callable[..., PostprocessPredictions]] = {
     "GREEDYNMM": GreedyNMMPostprocess,
@@ -174,7 +175,7 @@ def get_prediction(
 
 
 def get_sliced_prediction(
-    image: str | np.ndarray | Image.Image,
+    image: str | np.ndarray | Image.Image | LazyImageSource,
     detection_model: DetectionModel | None = None,
     slice_height: int | None = None,
     slice_width: int | None = None,
@@ -201,8 +202,9 @@ def get_sliced_prediction(
     """Function for slice image + get predicion for each slice + combine predictions in full image.
 
     Args:
-        image: str or np.ndarray
-            Location of image or numpy image matrix to slice
+        image: str or np.ndarray or LazyImageSource
+            Location of image or numpy image matrix to slice. A LazyImageSource reads each
+            slice on demand, which is how an image too large to decode can be predicted on.
         detection_model: model.DetectionModel
         slice_height: int
             Height of each slice.  Defaults to ``None``.
@@ -298,6 +300,7 @@ def get_sliced_prediction(
     if confidence_threshold is not None:
         detection_model.confidence_threshold = confidence_threshold
 
+    slice_image_result = None
     try:
         durations_in_seconds = dict()
 
@@ -314,6 +317,15 @@ def get_sliced_prediction(
             auto_slice_resolution=auto_slice_resolution,
         )
         from sahi.models.ultralytics import UltralyticsDetectionModel
+
+        if perform_standard_pred and (is_lazy_image_source(image) or slice_image_result.is_lazy):
+            # the standard pass predicts on the whole image at once, which a lazy source is
+            # used precisely because it cannot afford to hold
+            logger.warning(
+                "perform_standard_pred is not supported for a LazyImageSource, skipping the full-image pass. "
+                "Objects larger than a slice may be missed."
+            )
+            perform_standard_pred = False
 
         num_slices = len(slice_image_result)
         durations_in_seconds["slice"] = time.perf_counter() - time_start
@@ -367,13 +379,19 @@ def get_sliced_prediction(
         for batch_ind in slice_iterator:
             batch_start = batch_ind * batch_size
             batch_end = min(batch_start + batch_size, num_slices)
-            batch_images = [slice_image_result.images[i] for i in range(batch_start, batch_end)]
+            # per-slice accessors: `images` and `starting_pixels` each rebuild a list of
+            # every slice on access, and on a lazy source that reads the whole image
+            batch_images = [slice_image_result.slice_at(i) for i in range(batch_start, batch_end)]
             batch_shifts: list[list[int | float]] = [
-                list(slice_image_result.starting_pixels[i]) for i in range(batch_start, batch_end)
+                list(slice_image_result.starting_pixel_at(i)) for i in range(batch_start, batch_end)
             ]
             current_batch_size = len(batch_images)
 
             detection_model.perform_batch_inference([np.ascontiguousarray(img) for img in batch_images])
+            # the model has the batch now, so drop the slices before the next batch is read.
+            # Without this the comprehension above builds batch n+1 while batch n is still
+            # referenced, which costs a lazy source two batches of slices instead of one.
+            batch_images = []
             detection_model.convert_original_predictions(
                 shift_amount=batch_shifts,
                 full_shape=[full_shape] * current_batch_size,
@@ -427,6 +445,10 @@ def get_sliced_prediction(
             print("Postprocessing performed in", durations_in_seconds["postprocess"], "seconds.")
     finally:
         detection_model.confidence_threshold = original_confidence_threshold
+        if slice_image_result is not None:
+            # closes a source slice_image opened for us, and leaves one the caller passed
+            # in open, since closing that is the caller's to do
+            slice_image_result.close()
 
     return PredictionResult(
         image=image, object_prediction_list=object_prediction_list, durations_in_seconds=durations_in_seconds

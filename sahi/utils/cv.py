@@ -15,6 +15,7 @@ from PIL import Image, ImageOps
 from sahi.logger import logger
 from sahi.utils.file import Path
 from sahi.utils.import_utils import get_opencv_conflict_message
+from sahi.utils.lazy_image import is_lazy_image_source
 
 try:
     import cv2
@@ -273,6 +274,11 @@ def read_image_size(image: Image.Image | str | os.PathLike | np.ndarray, exif_fi
         >>> read_image_size("tests/data/small-vehicles1.jpeg")
         (1068, 580)
     """
+    if is_lazy_image_source(image):
+        # the source knows its own shape, and decoding it to ask would be the whole
+        # cost it exists to avoid
+        height, width = image.shape[:2]  # type: ignore[union-attr]
+        return int(width), int(height)
     if isinstance(image, np.ndarray):
         # read_image_as_pil transposes CHW input, so the reported size must match that
         hwc = _to_hwc(image)
@@ -325,6 +331,12 @@ def read_image_as_pil(
     """
     # https://stackoverflow.com/questions/56174099/how-to-load-images-larger-than-max-image-pixels-with-pil
     Image.MAX_IMAGE_PIXELS = None
+
+    if is_lazy_image_source(image):
+        raise TypeError(
+            "A LazyImageSource cannot be decoded as a whole image, which is the cost it exists to avoid. "
+            "Read a region with source[top:bottom, left:right], or pass the source to slice_image()."
+        )
 
     if isinstance(image, os.PathLike):
         # read_image_size takes a Path, so rejecting one here meant a path could size but not decode
